@@ -31,6 +31,9 @@ def get_llm():
 
 llm = get_llm()
 
+from src.agent.prompts import ANALYZE_STRUCTURE_SYSTEM_PROMPT, DRAFT_ROADMAP_SYSTEM_PROMPT, CONTEXT_EXPANSION_SYSTEM_PROMPT
+from src.agent.tools import read_file
+
 def analyze_structure(state: ReviewState) -> dict:
     """Groups files into logical components."""
     print("--- Node: Analyze Structure ---")
@@ -38,13 +41,9 @@ def analyze_structure(state: ReviewState) -> dict:
     files_list = "\n".join([f"- {f.path} ({f.status}, +{f.additions}/-{f.deletions})" for f in state.pr_context.files])
     
     prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a Senior Software Architect. Analyze the list of changed files and group them into logical components (e.g., 'Backend API', 'Frontend Components', 'Database Schema', 'Configuration'). Return JSON."),
+        ("system", ANALYZE_STRUCTURE_SYSTEM_PROMPT),
         ("human", "PR Title: {title}\n\nFiles:\n{files}")
     ])
-    
-    # In a real implementation, we'd use structued output. 
-    # For now, we'll ask for JSON text and parse it (or use with_structured_output if available/configured).
-    # keeping it simple for the skeleton.
     
     chain = prompt | llm
     response = chain.invoke({
@@ -52,16 +51,74 @@ def analyze_structure(state: ReviewState) -> dict:
         "files": files_list
     })
     
-    # Mocking the parsing for safety in this step, ideally we use structured output
-    # For V1 let's just store the raw text or try to parse
     return {"topology": {"analysis": response.content}}
 
 def context_expansion(state: ReviewState) -> dict:
     """Decides if we need to fetch more content."""
     print("--- Node: Context Expansion ---")
-    # Simple logic: If topology mentions 'high risk' or similar, we might fetch.
-    # For V1, we will skip the loop and just proceed to roadmap to get end-to-end working first.
-    return {"required_context": []}
+    
+    # 1. Bind Tools
+    tools = [read_file]
+    model_with_tools = llm.bind_tools(tools)
+    
+    # 2. Build Context
+    files_list = "\n".join([f"- {f.path} ({f.status})" for f in state.pr_context.files])
+    topology = state.topology.get('analysis', 'No analysis')
+    
+    context_str = f"""
+    PR Title: {state.pr_context.metadata.title}
+    
+    Files:
+    {files_list}
+    
+    Topology Analysis:
+    {topology}
+    
+    Comments:
+    {len(state.pr_context.comments)} existing comments.
+    """
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", CONTEXT_EXPANSION_SYSTEM_PROMPT),
+        ("human", "{context}")
+    ])
+    
+    chain = prompt | model_with_tools
+    response = chain.invoke({"context": context_str})
+    
+    # 3. Handle Tool Calls
+    fetched_content = {}
+    
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        print(f"--- Fetching {len(response.tool_calls)} files ---")
+        client = GitHubClient()
+        owner = state.pr_context.metadata.repo_url.split("/")[-4] # https://github.com/owner/repo
+        repo = state.pr_context.metadata.repo_url.split("/")[-3] # Or parse properly
+        # Better: parse from repo_url properly or pass in state.
+        # Quick parse for now, robust enough for standard URLs
+        
+        # Actually, GitHubClient.get_pr_context doesn't return owner/repo explicitly in metadata,
+        # but we can derive it or assume it's the same as the PR URL.
+        # Let's parse carefully.
+        # repo_url example: https://github.com/jwm4/platform
+        parts = state.pr_context.metadata.repo_url.rstrip("/").split("/")
+        repo = parts[-1]
+        owner = parts[-2]
+        sha = state.pr_context.metadata.head_commit_sha
+        
+        for tool_call in response.tool_calls:
+            if tool_call["name"] == "read_file":
+                path = tool_call["args"].get("path")
+                if path:
+                    print(f"Fetching: {path}")
+                    try:
+                        content = client.get_file_content(owner, repo, path, sha)
+                        fetched_content[path] = content
+                    except Exception as e:
+                        print(f"Error fetching {path}: {e}")
+                        fetched_content[path] = f"Error fetching content: {str(e)}"
+
+    return {"fetched_content": fetched_content}
 
 def draft_roadmap(state: ReviewState) -> dict:
     """Generates the final Markdown roadmap."""
@@ -73,8 +130,6 @@ def draft_roadmap(state: ReviewState) -> dict:
     pr_number = state.pr_context.metadata.number
     
     for f in state.pr_context.files:
-        # Base link for the file (Context for LLM to link to top of file)
-        # We start with line 1 so it opens the file in diff view, or just the anchor
         file_link = f.get_pr_diff_link(repo_url, pr_number)
         files_context.append(f"- {f.path} ({f.status}): {file_link}")
 
@@ -83,6 +138,16 @@ def draft_roadmap(state: ReviewState) -> dict:
     for c in state.pr_context.comments:
         location = f"({c.path}:{c.line})" if c.path else "(General)"
         comments_context.append(f"- {c.user} {location}: {c.body}")
+        
+    # Prepare Fetched Content Context
+    fetched_context_str = ""
+    if state.fetched_content:
+        fetched_context_str = "\n\nfetched_content:\n"
+        for path, content in state.fetched_content.items():
+            # Truncate if too long? 
+            # For now, simplistic truncation to 2000 chars to avoid blowing context
+            preview = content[:2000] + ("\n... (truncated)" if len(content) > 2000 else "")
+            fetched_context_str += f"\n--- File: {path} ---\n{preview}\n"
     
     context_str = f"""
     Title: {state.pr_context.metadata.title}
@@ -99,31 +164,11 @@ def draft_roadmap(state: ReviewState) -> dict:
     
     Existing Comments:
     {chr(10).join(comments_context) if comments_context else "No comments found."}
+    {fetched_context_str}
     """
     
     prompt = ChatPromptTemplate.from_messages([
-        ("system", """You are a benevolent Senior Staff Engineer guiding a junior reviewer.
-        Create a detailed Markdown roadmap for reviewing this PR.
-        
-        # Instructions
-        1. **Deep Links**: You MUST link to specific files and lines where possible using the PR Diff view.
-           - You have the `Files (with base links)` list which provides the base anchor for each file.
-           - To link to a specific line, append `R<line_number>` to the base link.
-           - Example provided in context: `https://.../files#diff-<hash>` -> add `R20` for line 20: `https://.../files#diff-<hash>R20`.
-           - Usage: "Check the authentication logic in [auth.ts](...link...)".
-        
-        2. **Context Awareness**: Use the provided "Existing Comments" to verify your claims.
-        
-        3. **No Time Estimates**: Do NOT guess how long the review will take (e.g., "10 min read").
-
-        # Structure
-        1. **High-Level Summary**: What is this PR doing conceptually?
-        2. **Review Order**: Group files logically and suggest an order.
-        3. **Watch Outs**: Specific things to check (logic holes, security).
-        4. **Existing Discussions**: Summarize key themes from the comments.
-        
-        Do not be generic. Be specific to the file paths and names provided.
-        """),
+        ("system", DRAFT_ROADMAP_SYSTEM_PROMPT),
         ("human", "{context}")
     ])
     
