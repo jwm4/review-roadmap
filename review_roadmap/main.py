@@ -5,7 +5,7 @@ from review_roadmap.github.client import GitHubClient
 from review_roadmap.agent.graph import build_graph
 from review_roadmap.config import settings
 
-app = typer.Typer()
+app = typer.Typer(add_completion=False)
 console = Console()
 
 
