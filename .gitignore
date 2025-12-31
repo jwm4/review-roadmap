@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+*.py[cod]
 .env
 .venv/
 .idea/
@@ -7,3 +8,9 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+.agentready/
+.local-docs/
+.pytest_cache/
+.DS_Store
+*.swp
+*.swo
