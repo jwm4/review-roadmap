@@ -12,10 +12,32 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 def get_llm():
     provider = settings.REVIEW_ROADMAP_LLM_PROVIDER.lower()
     
+    # Set a reasonable max_tokens to avoid truncated responses
+    # Roadmaps can be lengthy, so we allow up to 4096 tokens
+    max_tokens = 4096
+    
     if provider == "anthropic":
         return ChatAnthropic(
             model_name=settings.REVIEW_ROADMAP_MODEL_NAME,
-            api_key=settings.ANTHROPIC_API_KEY
+            api_key=settings.ANTHROPIC_API_KEY,
+            max_tokens=max_tokens
+        )
+    elif provider == "anthropic-vertex":
+        from langchain_google_vertexai.model_garden import ChatAnthropicVertex
+        
+        # Set up Google credentials if specified
+        credentials_path = settings.get_google_credentials_path()
+        if credentials_path:
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
+        
+        if not settings.ANTHROPIC_VERTEX_PROJECT_ID:
+            raise ValueError("ANTHROPIC_VERTEX_PROJECT_ID must be set when using anthropic-vertex provider")
+        
+        return ChatAnthropicVertex(
+            model_name=settings.REVIEW_ROADMAP_MODEL_NAME,
+            project=settings.ANTHROPIC_VERTEX_PROJECT_ID,
+            location=settings.ANTHROPIC_VERTEX_REGION,
+            max_tokens=max_tokens
         )
     elif provider == "anthropic-vertex":
         from langchain_google_vertexai.model_garden import ChatAnthropicVertex
@@ -36,12 +58,14 @@ def get_llm():
     elif provider == "openai":
         return ChatOpenAI(
             model_name=settings.REVIEW_ROADMAP_MODEL_NAME,
-            api_key=settings.OPENAI_API_KEY
+            api_key=settings.OPENAI_API_KEY,
+            max_tokens=max_tokens
         )
     elif provider == "google":
         return ChatGoogleGenerativeAI(
             model=settings.REVIEW_ROADMAP_MODEL_NAME,
-            google_api_key=settings.GOOGLE_API_KEY
+            google_api_key=settings.GOOGLE_API_KEY,
+            max_output_tokens=max_tokens
         )
     else:
         raise ValueError(f"Unsupported LLM provider: {provider}")
