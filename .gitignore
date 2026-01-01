@@ -11,6 +11,8 @@ build/
 .agentready/
 .local-docs/
 .pytest_cache/
+.coverage
+htmlcov/
 .DS_Store
 *.swp
 *.swo
